@@ -1,0 +1,66 @@
+# Local stack: the same image as EC2, with Postgres, no AWS needed.
+#
+#   docker compose up --build -d
+#   curl localhost:8080/health          # "web" host (On-Demand)
+#   curl localhost:8081/health          # "worker" host pretending to be Spot: critical -> 503
+#
+# CI runs the quick traffic simulation against this before any terraform apply.
+# No queue locally: with QUEUE_URL empty, non-critical jobs are processed inline.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: finops
+      POSTGRES_USER: finops_admin
+      # Local throwaway database only: trust auth, so no password exists anywhere in the repo.
+      POSTGRES_HOST_AUTH_METHOD: trust
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U finops_admin -d finops"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  api:
+    build:
+      context: .
+      dockerfile: app/Dockerfile
+    image: finops-cloudscale-app:local
+    environment:
+      ROLE: web
+      DB_HOST: db
+      DB_NAME: finops
+      DB_USER: finops_admin
+      DB_SSLMODE: disable
+      INSTANCE_LIFECYCLE: on-demand
+    ports:
+      - "8080:8080"
+    # Healthy only once the app has reached Postgres, so `docker compose up --wait`
+    # (CI) never starts the traffic simulation against a half-ready API.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,sys,urllib.request; sys.exit(0 if json.load(urllib.request.urlopen('http://localhost:8080/health'))['db_ready'] else 1)"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    depends_on:
+      db:
+        condition: service_healthy
+
+  spot-api:
+    image: finops-cloudscale-app:local
+    environment:
+      ROLE: worker
+      DB_HOST: db
+      DB_NAME: finops
+      DB_USER: finops_admin
+      DB_SSLMODE: disable
+      INSTANCE_LIFECYCLE: spot
+    ports:
+      - "8081:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,sys,urllib.request; sys.exit(0 if json.load(urllib.request.urlopen('http://localhost:8080/health'))['db_ready'] else 1)"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    depends_on:
+      api:
+        condition: service_healthy

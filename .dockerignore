@@ -1,0 +1,6 @@
+# The image is built from the repo root but only needs app/ and the priority sheet.
+*
+!app/requirements.txt
+!app/cloudscale/
+!data/service_priority.xlsx
+**/__pycache__

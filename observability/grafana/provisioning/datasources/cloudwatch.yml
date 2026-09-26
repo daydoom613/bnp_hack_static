@@ -1,0 +1,12 @@
+apiVersion: 1
+
+datasources:
+  - name: CloudWatch
+    type: cloudwatch
+    uid: cloudwatch
+    isDefault: true
+    jsonData:
+      # AWS SDK default chain: env credentials, then the mounted ~/.aws profile (AWS_PROFILE).
+      authType: default
+      defaultRegion: eu-west-1
+      customMetricsNamespaces: FinOps/Cost,FinOps/App

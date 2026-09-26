@@ -64,12 +64,12 @@ cost, and `cost_report.py` turns it into `cost_savings.csv`.
 | `terraform/environments/baseline/` | The static baseline. **Plan only.** |
 | `terraform/modules/` | network, alb, compute (ASG, mixed instances, lifecycle hook), rds, iam, storage, queue, scaling, functions, chaos. |
 | `policies/` | OPA/Rego budget guard + tag rule, with `opa test` cases in `policies/tests/`. |
-| `finops/` | `cost_model.py` (plan → projected cost), `optimized_cost.py` (measured cost), `cost_report.py` (→ `cost_savings.csv`). |
+| `finops/` | `cost_model.py` (plan → projected cost), `optimized_cost.py` (measured cost), `cost_report.py` (→ `cost_savings.csv`), `window_summary.py` (scaling/queue/latency over a test window), `validate_inputs.py` (the dataset files vs the Dataset Building Document). |
 | `finops-app/` | Traffic simulator (`simulator/traffic_sim.py`), profiles in `finops-app/data/`. |
-| `scripts/` | Build/push, plan + guard, load test, Spot-guard test, queue-spike test, budget-alert demo. |
+| `scripts/` | **`run_tests.sh` (every Basic + Advanced test case, PASS/FAIL)**, build/push, plan + guard, load test, Spot-guard test, queue-spike test, budget-alert demo. |
 | `chaos/` | Spot interruption (FIS), latency injection (tc), scale-in under load, evidence collection. |
 | `observability/` | Grafana (docker compose) with the CloudWatch datasource and the FinOps dashboard JSON. |
-| `data/` | The challenge inputs. `budget_cap.txt` = 120, `baseline_cost.json` = 91.10. |
+| `data/` | The challenge inputs: `budget_cap.txt` = 120, `baseline_cost.json` = 91.10, `pricing_matrix.csv`, `service_priority.xlsx`, `traffic_profiles.csv` (the Dataset document's profile), `security_baseline.docx`, plus `service_priority_30pct.xlsx` for the 30%-critical test. |
 | `.github/workflows/deploy.yml` | validate → quick traffic sim → image → plan + OPA → apply → smoke + sim → S3. |
 
 ---
@@ -100,8 +100,9 @@ pip install -r finops-app/requirements.txt -r app/requirements-dev.txt
 
 ```bash
 pytest -q app/tests                    # API + Spot guard unit tests
-opa test policies -v                   # 14 budget/tag policy tests
-docker compose up --build -d           # app :8080 (On-Demand), "Spot" app :8081, Postgres
+opa test policies -v                   # 16 budget/tag/mixed-instances policy tests
+python finops/validate_inputs.py       # the 6 dataset inputs vs the Dataset Building Document
+docker compose up --build -d --wait    # app :8080 (On-Demand), "Spot" app :8081, Postgres
 curl -X POST localhost:8081/process -H 'Content-Type: application/json' -d '{"request_type":"CreateOrder"}'   # -> 503
 docker compose down
 ```
@@ -135,10 +136,27 @@ curl "$(terraform -chdir=terraform/environments/dev output -raw health_url)"    
 ### 5. Open the dashboard
 
 ```bash
-docker compose -f observability/docker-compose.yml up -d   # http://localhost:3000/d/finops-cloudscale
+AWS_PROFILE=finops docker compose -f observability/docker-compose.yml up -d
 ```
 
-It shows live web/worker/Spot counts, projected vs baseline cost, avoided cost, queue length, CPU, latency and 5xx. The **Budget used** panel turns **red at ≥ 90%** of the cap.
+Or, on Windows without Docker (or where Docker containers can't reach the internet):
+
+```powershell
+powershell -File observability\grafana-windows.ps1 -Profile finops   # needs Grafana extracted to %USERPROFILE%\grafana\grafana-v11.3.0
+```
+
+Either way, open **http://localhost:3000/d/finops-cloudscale** (refreshes every 10 s; admin/admin to edit). It shows live web/worker/Spot counts, projected vs baseline cost, avoided cost, queue length, CPU, latency and 5xx. The **Budget used** panel turns **red at ≥ 90%** of the cap.
+
+### Live demo (15 minutes, for presenting)
+
+```bash
+AWS_PROFILE=finops scripts/live_demo.sh
+```
+
+This replays a sharp profile: 1 min warm-up, 9 min at 200 RPS, then a 5-min lull. The load is generated **inside eu-west-1**: the real simulator runs in a container on a worker instance, sent over SSM. Responses come back in ~40 ms whatever your own internet is like (`FROM=here` generates the load locally instead). The terminal prints the fleet every 15 s while Grafana shows the same thing:
+- **~1 min in:** the request-count alarm fires and web instances launch.
+- **Peak:** the queue builds and workers scale out; the 4th worker is Spot.
+- **After the lull:** both tiers scale back in within ~5 min.
 
 ### 6. Measure the savings
 
@@ -146,12 +164,26 @@ Run this from **AWS CloudShell** in eu-west-1 so latency is measured in-region: 
 
 ```bash
 scripts/run_load_test.sh                                          # 75-min profile (default)
-scripts/run_load_test.sh finops-app/data/traffic_profiles.csv     # the Dataset document's 4.7 h profile
+scripts/run_load_test.sh data/traffic_profiles.csv     # the Dataset document's 4.7 h profile
 ```
 
 The result lands in `reports/load-<ts>/cost_savings.csv`: baseline, optimized (measured), avoided, % savings and budget use. It is also uploaded to `s3://<artifacts>/reports/`.
 
-### 7. Run the tests and chaos experiments (see the test catalogue below)
+### 7. Run every test case
+
+```bash
+scripts/run_tests.sh basic        # B1-B6, ~20 min
+scripts/run_tests.sh advanced     # A1-A5, ~1.5 h (A1 replays the 75-min profile; FULL_PROFILE=1 for 4.7 h)
+scripts/run_tests.sh B3 A4        # any subset
+```
+
+Each test prints PASS/FAIL with its evidence, and the run ends with a table. Everything also lands in `evidence/tests-<ts>/` and `s3://<artifacts>/evidence/`.
+
+**Run it where latency is fair.** B3's "< 200 ms average" is measured wherever the simulator runs. From India, the round trip to eu-west-1 alone is about 150–200 ms, so use one of these:
+- **CI (easiest):** Actions → deploy → Run workflow, `tests = advanced`. Every Basic and Advanced test runs unattended after the apply, and that run is itself Advanced test A5.
+- **AWS CloudShell** in eu-west-1: clone the repo, install Terraform (`curl -sLo t.zip https://releases.hashicorp.com/terraform/1.16.2/terraform_1.16.2_linux_amd64.zip && unzip t.zip -d ~/bin`), then `pip install -r finops-app/requirements.txt`, `terraform -chdir=terraform/environments/dev init -backend-config=backend.hcl`, and `scripts/run_tests.sh all`.
+
+Then the chaos experiments: `chaos/spot_interruption.sh`, `chaos/latency_injection.sh`, `chaos/scale_in_test.sh`.
 
 ### 8. Tear down when you stop working
 
@@ -169,8 +201,9 @@ Or use **Actions → deploy → Run workflow → destroy**. The evidence bucket 
 
 After that:
 - **Pull requests** get validate → quick traffic sim → plan + OPA for both stacks, plus a PR comment.
-- **Merges to `main`** also apply the exact approved plan, smoke-test `/health`, run a short simulation against the ALB and store `traffic_report.csv` in S3.
-- **Once CI works, only CI applies.**
+- **Merges to `main`** also apply the exact approved plan, smoke-test `/health`, run a short simulation against the ALB, store `traffic_report.csv` in S3, and run the **Basic test cases** (B1–B6).
+- **Actions → deploy → Run workflow → `tests = advanced`** runs Basic + Advanced (about 2 h) with no manual step.
+- **Once CI works, only CI applies.** Don't add required reviewers to the `dev` environment: the pipeline must run end to end unattended.
 
 ---
 
@@ -195,9 +228,9 @@ A realistic hackathon comes to about $10. That covers roughly 30 h of stack upti
 | 1 | Terraform full stack | `terraform/`: VPC, ALB, On-Demand Web ASG, Spot-enabled Worker ASG, RDS, SQS, Lambdas, FIS, encrypted remote state (S3 + KMS CMK + DynamoDB lock), IAM roles, mandatory tags via `default_tags` and ASG propagation. ECS/API Gateway were examples; the API runs on EC2 as item 2 requires. |
 | 2 | EC2 REST API on RDS via ALB, CRUD + `/metrics` | `app/`: `/items` CRUD, `/orders`, `/catalog`, `/process`, `/health`, Prometheus `/metrics`. |
 | 3 | Python traffic simulator, CSV profile → `traffic_report.csv` in S3 | `finops-app/simulator/traffic_sim.py` (httpx async). `run_load_test.sh` and CI upload to `s3://<artifacts>/reports/`. |
-| 4 | CPU ≈ 50% + RequestCount scaling, Web 1 → ≥ 4 and back | `modules/scaling`: target tracking at 50%, step scaling on ALB `RequestCountPerTarget` and CPU > 70% × 2. Target tracking scales in after the lull. |
+| 4 | CPU ≈ 50% + RequestCount scaling, Web 1 → ≥ 4 and back | `modules/scaling`. Scale-out: CPU target tracking at 50%, step scaling on ALB `RequestCountPerTarget` > 40 RPS per instance, and CPU > 70% × 2 periods. Scale-out on request count reacts within 1 minute. Scale-in: `RequestCountPerTarget` < 20 RPS per instance for 5 min. That gives 50 RPS → 2 web instances, 80 → 3, 150+ → 4, and back to 1 after the lull. |
 | 5 | Worker 70/30 mixed, capacity-optimized, lifecycle drain | `modules/compute` (mixed policy, capacity rebalance, termination hook) + `lambdas/spot_drain`. The app also watches the 2-min Spot notice itself. |
-| 6 | OPA blocks over-budget / untagged plans | `policies/budget.rego`, `tags.rego`, 14 tests. The cost comes from `cost_model.py` (Infracost-shaped JSON). Raw Infracost JSON is accepted too, and Infracost runs in CI when `INFRACOST_API_KEY` is set. |
+| 6 | OPA blocks over-budget / untagged plans | `policies/budget.rego`, `tags.rego`, 16 tests (budget, tags, t3 whitelist, a Spot-enabled mixed-instances worker required in the dynamic stack). The cost comes from `cost_model.py` (Infracost-shaped JSON). Raw Infracost JSON is accepted too, and Infracost runs in CI when `INFRACOST_API_KEY` is set. |
 | 7 | CI: fmt/validate, OPA, quick sim, then apply | `.github/workflows/deploy.yml` |
 | 8 | Grafana: instances, projected cost, avoided cost, red ≥ 90% | `observability/`. The dashboard JSON is importable. There is also a CloudWatch alarm `<stack>-budget-90pct`. |
 | 9 | Chaos: Spot termination + latency, logs/video | `chaos/spot_interruption.sh` (FIS), `chaos/latency_injection.sh` (tc netem), `chaos/scale_in_test.sh`. Evidence goes to S3. Screen-record Grafana while they run. |
@@ -205,22 +238,30 @@ A realistic hackathon comes to about $10. That covers roughly 30 h of stack upti
 
 ## Test catalogue (the problem statement's tables)
 
+`scripts/run_tests.sh` runs every Basic and Advanced case with these exact pass criteria.
+
+| ID | Test | How | Pass when |
+|---|---|---|---|
+| B1 | Deploy the Terraform stack | apply (step 4 or CI), then `run_tests.sh B1` | ALB active, RDS available, both ASGs InService, both Lambdas Active; tagged resources listed |
+| B2 | `/health` 200 within 100 ms | curl from here, plus 11 curls from a web instance via SSM (in-region) | HTTP 200 and in-region median < 100 ms |
+| B3 | 50 RPS for 5 min | simulator, `traffic_profile_constant.csv`, gate `MAX_ERROR_RATE=5 MAX_AVG_LATENCY_MS=200` | ≤ 5% errors, average < 200 ms, `traffic_report.csv` in S3 |
+| B4 | Web ≥ 2 when CPU > 70% for two periods | web reset to 1, then 150 RPS of critical requests (`traffic_profile_cpu.csv`) | InService ≥ 2 with a launch activity; CPU max and `web-cpu-high` ALARM transitions recorded |
+| B5 | OPA passes the baseline plan | `scripts/plan_and_check.sh baseline` | `allow = true` (91.10 ≤ 120) |
+| B6 | CI green | latest completed deploy run (`gh`), or the running workflow in CI | conclusion `success` |
+| A1 | Full profile: web ≤ 8 at peak, Spot workers when queue_length > 50 | `scripts/run_load_test.sh` (75 min; `FULL_PROFILE=1` = the Dataset document's 4.7 h) | 2 ≤ web max ≤ 8, queue_length max > 50, Spot workers max ≥ 1; `cost_savings.csv` written |
+| A2 | 30% critical, never processed on Spot | A1's traffic uses `data/service_priority_30pct.xlsx` (weights 15/15/70), plus `scripts/test_spot_guard.sh` | critical share 25–35%, `critical_on_spot = 0`, Spot hosts → 503, On-Demand hosts → 200 |
+| A3 | Cheaper RI option + new budget_cap → OPA blocks | re-plan dev with `budget_cap = 80`, then again with `ON_DEMAND_RATE=reserved` | On-Demand plan blocked: "projected monthly cost 85.85 exceeds budget_cap 80"; RI-priced plan (47.30) allowed |
+| A4 | queue_length spike to 120 → a Spot worker | `scripts/test_queue_spike.sh`: workers at 3 (all On-Demand), then publish 120 | desired capacity +1 (3 → 4) and a Spot worker is running |
+| A5 | Full CI pipeline with the advanced load, unattended | deploy workflow with `tests = advanced` | that run's conclusion `success` |
+
+Expert (chaos) tests have their own scripts, and each uploads its evidence to `s3://<artifacts>/evidence/`:
+
 | Test | Command | Expected |
 |---|---|---|
-| Deploy the stack | step 4 or CI | apply succeeds |
-| `/health` 200 within 100 ms | `curl -w '%{time_total}' $(... output -raw health_url)` from CloudShell | 200, no DB access |
-| 50 RPS for 5 min | `MAX_ERROR_RATE=5 MAX_AVG_LATENCY_MS=200 scripts/run_load_test.sh finops-app/data/traffic_profile_constant.csv` | ≤ 5% errors, avg < 200 ms (exit code 0) |
-| Web scales to ≥ 2 at CPU > 70% | the peak of any load test | `web_scaling_activities.json` / Grafana |
-| OPA passes a baseline plan | `scripts/plan_and_check.sh baseline` | `allow = true` |
-| CI green | push to `main` | all jobs pass |
-| Full profile, Web ≤ 8, Spot workers at queue > 50 | `scripts/run_load_test.sh finops-app/data/traffic_profiles.csv` | web 1 → 4, workers scale on queue_length |
-| 30% critical, never on Spot | `scripts/test_spot_guard.sh`, plus every load test (`CRITICAL_SHARE=0.3`) | Spot hosts → 503. `critical_on_spot = 0` in `traffic_report.csv` |
-| Cheaper RI + new cap → OPA blocks | `echo 80 > cap80.txt; BUDGET_CAP_FILE=cap80.txt scripts/plan_and_check.sh dev` → blocked; add `ON_DEMAND_RATE=reserved` → 47.30, allowed | `allow = false`, "projected monthly cost 85.85 exceeds budget_cap 80" |
-| queue_length spike 120 → +1 worker | `scripts/test_queue_spike.sh` | desired capacity +1 |
 | Spot termination (FIS) | `chaos/spot_interruption.sh` | drained, replaced < 2 min, no 5xx |
 | +200 ms / 5% loss for 60 s | `chaos/latency_injection.sh` (run from CloudShell) | increase ≤ 300 ms, errors ≤ 2% |
 | Scale-in under load | `chaos/scale_in_test.sh` | targets drain, API stays healthy |
-| Evidence to S3 | every script uploads; `chaos/collect_evidence.sh 60` for ad-hoc windows | `s3://<artifacts>/evidence/` |
+| Evidence for a window | `chaos/collect_evidence.sh 60` | logs, activities, alarms in S3 |
 | Red budget alert | `scripts/budget_alert_demo.sh 25`, then `scripts/budget_alert_demo.sh reset` | Grafana panel red, alarm ALARM |
 
 ## Contract between the pieces
@@ -249,6 +290,8 @@ A realistic hackathon comes to about $10. That covers roughly 30 h of stack upti
 - **Projected cost uses ASG `max_size`**, the most a plan could ever run. The measured optimized cost uses what actually ran.
 - **Cost scope is EC2 compute**, the same on both sides. The pricing matrix has no ALB/NAT/RDS rates, and those are identical in both stacks. For the full bill, set `INFRACOST_API_KEY` and Infracost runs next to the model in CI.
 - **Spot appears at 4 workers.** AWS rounds the On-Demand share of a 70/30 split up: 1–3 workers are all On-Demand, and 4 gives 3 + 1 Spot. The test scripts raise the worker ASG to 4 when they need a Spot host.
+- **Scale-in alarms re-fire every minute.** While traffic or the queue is quiet they stay in ALARM, and CloudWatch re-runs Auto Scaling actions every minute. Tests that grow a fleet on purpose pause those alarm actions (`hold_scale_in` in `scripts/lib.sh`) and restore them on exit.
+- **CPU target tracking only scales out.** Scale-in is request-based. With both scaling in, the peak fleet would flap between request-sized and CPU-sized.
 - **Latency chaos targets the ALB path.** netem applies only to packets bound for the ALB's subnets, so DB and SQS round trips aren't counted twice. That matches "on the ALB" in the problem statement.
 - **Latency is measured from wherever the simulator runs.** From India, the round trip to eu-west-1 alone is about 150–200 ms. Use CloudShell for the 300 ms tests, and compare the before/during *increase*, which is what the latency script reports.
 - **Forced scale-in** sets the Web ASG's desired capacity straight to its minimum under load. Moving an alarm threshold would scale out, not in.

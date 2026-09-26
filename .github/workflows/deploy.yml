@@ -1,0 +1,526 @@
+# FinOps CloudScale pipeline (Definition of Done #7):
+#
+#   validate    terraform fmt/validate, OPA check + opa test, pytest, compile, no CRLF
+#   load-test   quick traffic-sim run against the app + Postgres in docker compose (gate:
+#               error rate <= 5 %, avg latency < 200 ms, critical never on Spot)
+#   image       build; on main push to ECR if image_tag is new
+#   plan        dev (dynamic) plan + static baseline plan -> cost_model.py -> OPA budget guard
+#   apply       main only, the exact plan OPA approved -> /health smoke test -> short
+#               traffic-sim run against the ALB, traffic_report.csv stored in S3
+#   tests       the problem statement's test cases against the live stack (scripts/run_tests.sh):
+#               basic on every push to main; basic + advanced when run with tests=advanced
+#
+# Pull requests stop after the plan and get the result as a PR comment.
+# Keep the "dev" GitHub environment free of required reviewers: the pipeline must run
+# end to end without manual intervention (Advanced test A5).
+#
+# Secrets:  AWS_ROLE_ARN        terraform -chdir=terraform output -raw ci_role_arn
+#           INFRACOST_API_KEY   optional; adds Infracost's full bill alongside the CSV model
+name: deploy
+run-name: "deploy: ${{ github.event_name }} tests=${{ github.event_name == 'pull_request' && 'none' || inputs.tests || 'basic' }}"
+
+on:
+  pull_request:
+    paths:
+      - "terraform/**"
+      - "scripts/**"
+      - "policies/**"
+      - "finops/**"
+      - "data/**"
+      - "app/**"
+      - "lambdas/**"
+      - "finops-app/simulator/**"
+      - "finops-app/data/**"
+      - "docker-compose.yml"
+      - ".github/workflows/deploy.yml"
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - "scripts/**"
+      - "policies/**"
+      - "finops/**"
+      - "data/**"
+      - "app/**"
+      - "lambdas/**"
+      - "finops-app/simulator/**"
+      - "finops-app/data/**"
+      - "docker-compose.yml"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "apply (plan + guard + apply) or destroy"
+        type: choice
+        options: [apply, destroy]
+        default: apply
+      tests:
+        description: "test cases to run after apply (advanced = basic + advanced, about 2 h)"
+        type: choice
+        options: [none, basic, advanced]
+        default: basic
+      full_profile:
+        description: "advanced: replay the Dataset document's full 4.7 h profile instead of the 75-min one"
+        type: boolean
+        default: false
+  # Destroy every night to protect the credit. Uncomment to enable.
+  # schedule:
+  #   - cron: "0 20 * * *"
+
+permissions:
+  id-token: write # OIDC -> AWS, no stored keys
+  contents: read
+  pull-requests: write # plan comment
+
+env:
+  AWS_REGION: eu-west-1
+  ENV_DIR: terraform/environments/dev
+  BASELINE_DIR: terraform/environments/baseline
+  ECR_REPOSITORY: finops-cloudscale-app
+  TF_VERSION: "1.16.2" # must be >= the version that last wrote the state (local applies use 1.16.2)
+  OPA_VERSION: "0.70.0"
+  TF_IN_AUTOMATION: "true"
+  INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+
+jobs:
+  validate:
+    name: fmt / validate / policy tests / unit tests
+    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.action == 'apply')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: open-policy-agent/setup-opa@v2
+        with:
+          version: ${{ env.OPA_VERSION }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff terraform
+
+      - name: terraform validate (bootstrap, dev, baseline)
+        run: |
+          for dir in terraform "$ENV_DIR" "$BASELINE_DIR"; do
+            terraform -chdir="$dir" init -backend=false -input=false
+            terraform -chdir="$dir" validate
+          done
+
+      - name: OPA policies compile, are formatted and pass their tests
+        run: |
+          opa check --strict policies
+          opa fmt --list --fail policies
+          opa test policies -v
+
+      - name: App unit tests
+        run: |
+          pip install -r app/requirements-dev.txt
+          pytest -q app/tests
+
+      - name: Dataset inputs match the Dataset Building Document
+        run: python finops/validate_inputs.py
+
+      - name: Lint shell scripts
+        run: shellcheck -x -S warning scripts/*.sh chaos/*.sh
+
+      - name: Python compiles
+        run: python -m py_compile finops/*.py lambdas/*/handler.py finops-app/simulator/traffic_sim.py observability/build_dashboard.py
+
+      - name: No CRLF in scripts, Terraform or Python (a CRLF user_data.sh never starts the app)
+        run: |
+          if grep -rlI $'\r' scripts chaos terraform app lambdas policies finops \
+              --include='*.sh' --include='*.tf' --include='*.tfvars' --include='*.hcl' --include='*.py' --include='*.rego'; then
+            echo "::error::CRLF line endings found in the files above"
+            exit 1
+          fi
+
+  load-test:
+    name: Quick traffic-sim run (local stack)
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Start app + Postgres
+        run: docker compose up --build -d --wait
+
+      - name: Traffic simulator (60 s at 10 RPS, 30 % critical) with pass/fail gate
+        working-directory: finops-app
+        env:
+          TARGET_API_URL: http://localhost:8080/process
+          TRAFFIC_PROFILE: data/traffic_profile_ci.csv
+          SERVICE_PRIORITY_FILE: ../data/service_priority.xlsx
+          REPORT_DIR: ../ci-reports
+          CRITICAL_SHARE: "0.3"
+          MAX_ERROR_RATE: "5"
+          MAX_AVG_LATENCY_MS: "200"
+          AWS_ENABLED: "false"
+        run: |
+          pip install -r requirements.txt
+          python simulator/traffic_sim.py
+
+      - name: Spot guard (critical request on the Spot-flavoured host must get 503)
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST localhost:8081/process \
+            -H 'Content-Type: application/json' -d '{"request_type":"CreateOrder","critical":true}')
+          echo "Spot host answered $code to CreateOrder"
+          test "$code" = "503"
+
+      - name: Container logs
+        if: failure()
+        run: docker compose logs --no-color
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ci-traffic-report
+          path: ci-reports/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  image:
+    name: App image
+    needs: [validate, load-test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read image_tag from terraform.tfvars
+        id: meta
+        run: |
+          tag=$(sed -nE 's/^[[:space:]]*image_tag[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$ENV_DIR/terraform.tfvars")
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Build only (pull request)
+        if: github.event_name == 'pull_request'
+        run: docker build --platform linux/amd64 -f app/Dockerfile -t "app:${{ steps.meta.outputs.tag }}" .
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: github.event_name != 'pull_request'
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr
+        if: github.event_name != 'pull_request'
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Tags are immutable: to ship a new app version, bump image_tag in terraform.tfvars.
+      - name: Push image_tag if ECR does not have it yet
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          if aws ecr describe-images --repository-name "$ECR_REPOSITORY" --image-ids imageTag="$TAG" >/dev/null 2>&1; then
+            echo "$IMAGE already exists; not rebuilding."
+          else
+            docker build --platform linux/amd64 -f app/Dockerfile -t "$IMAGE" .
+            docker push "$IMAGE"
+          fi
+
+  plan:
+    name: Plan + budget guard (OPA)
+    needs: [validate, load-test, image]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: open-policy-agent/setup-opa@v2
+        with:
+          version: ${{ env.OPA_VERSION }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: terraform init
+        run: |
+          terraform -chdir="$ENV_DIR" init -input=false -backend-config=backend.hcl
+          terraform -chdir="$BASELINE_DIR" init -input=false
+
+      # plan -> plan.json -> finops/cost_model.py -> opa eval data.finops.allow
+      # Fails the job (and so blocks apply) when OPA denies either plan.
+      - name: Static baseline plan (plan only) + OPA
+        run: bash scripts/plan_and_check.sh baseline 2>&1 | tee "$BASELINE_DIR/guard.log"
+
+      - name: Dynamic stack plan + OPA
+        run: bash scripts/plan_and_check.sh dev 2>&1 | tee "$ENV_DIR/guard.log"
+
+      - name: Infracost (full bill, alongside the CSV model)
+        if: always() && env.INFRACOST_API_KEY != '' && hashFiles('terraform/environments/dev/plan.json') != ''
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ env.INFRACOST_API_KEY }}
+
+      - name: Infracost breakdown
+        if: always() && env.INFRACOST_API_KEY != '' && hashFiles('terraform/environments/dev/plan.json') != ''
+        run: |
+          infracost breakdown --path "$ENV_DIR/plan.json" --format json --out-file "$ENV_DIR/infracost.json"
+          infracost output --path "$ENV_DIR/infracost.json" --format table > "$ENV_DIR/infracost.txt"
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## Plan + budget guard"
+            for dir in "$BASELINE_DIR" "$ENV_DIR"; do
+              echo
+              echo "### $(basename "$dir")"
+              echo '```'
+              grep -E '^(Plan:|No changes)' "$dir/guard.log" || true
+              grep 'Projected monthly compute cost' "$dir/guard.log" || true
+              sed -n '/^OPA budget guard/,$p' "$dir/guard.log" || true
+              echo '```'
+            done
+            if [ -f "$ENV_DIR/infracost.txt" ]; then
+              echo "### Infracost (full bill)"
+              echo '```'
+              cat "$ENV_DIR/infracost.txt"
+              echo '```'
+            fi
+          } > comment.md
+          cat comment.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment on the PR
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          gh pr comment "$PR" --body-file comment.md --edit-last ||
+            gh pr comment "$PR" --body-file comment.md
+
+      # lambda_build/ holds the Lambda zips the saved plan points at; apply needs them.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dev-plan
+          path: |
+            ${{ env.ENV_DIR }}/tfplan
+            ${{ env.ENV_DIR }}/plan.json
+            ${{ env.ENV_DIR }}/cost_model.json
+            ${{ env.ENV_DIR }}/opa_input.json
+            ${{ env.ENV_DIR }}/guard.log
+            ${{ env.ENV_DIR }}/infracost.json
+            ${{ env.ENV_DIR }}/lambda_build/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: baseline-plan
+          path: |
+            ${{ env.BASELINE_DIR }}/cost_model.json
+            ${{ env.BASELINE_DIR }}/guard.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  apply:
+    name: Apply + smoke test + traffic report to S3
+    needs: plan
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.action == 'apply'))
+    runs-on: ubuntu-latest
+    environment: dev
+    concurrency:
+      group: dev-state
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dev-plan
+          path: ${{ env.ENV_DIR }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: baseline-plan
+          path: ${{ env.BASELINE_DIR }}
+
+      - name: terraform init
+        run: terraform -chdir="$ENV_DIR" init -input=false -backend-config=backend.hcl
+
+      - name: terraform apply (the exact plan OPA approved)
+        run: terraform -chdir="$ENV_DIR" apply -input=false -lock-timeout=5m tfplan
+
+      # New instances install Docker and pull the image first, so allow ~15 min.
+      - name: Smoke test /health
+        run: |
+          url=$(terraform -chdir="$ENV_DIR" output -raw health_url)
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$url" || true)
+            if [ "$code" = "200" ]; then
+              t=$(curl -s -o /dev/null -w '%{time_total}' --max-time 5 "$url")
+              echo "$url -> 200 in ${t}s (from the GitHub runner, not from inside eu-west-1)" | tee -a "$GITHUB_STEP_SUMMARY" health.log
+              exit 0
+            fi
+            echo "attempt $i/60: HTTP $code, retrying in 15s"
+            sleep 15
+          done
+          echo "::error::$url did not return 200"
+          exit 1
+
+      - name: Traffic sim against the ALB, traffic_report.csv to S3
+        working-directory: finops-app
+        run: |
+          pip install -r requirements.txt
+          export TARGET_API_URL="$(terraform -chdir="../$ENV_DIR" output -raw app_url)/process"
+          export S3_BUCKET="$(terraform -chdir="../$ENV_DIR" output -raw artifacts_bucket)"
+          TRAFFIC_PROFILE=data/traffic_profile_ci.csv \
+          SERVICE_PRIORITY_FILE=../data/service_priority.xlsx \
+          REPORT_DIR=../ci-reports \
+          CRITICAL_SHARE=0.3 MAX_ERROR_RATE=5 \
+          AWS_ENABLED=true S3_PREFIX="reports/ci-${{ github.run_id }}/" \
+            python simulator/traffic_sim.py
+
+      - name: Store cost, guard log and health in the artifacts bucket
+        if: always()
+        run: |
+          bucket=$(terraform -chdir="$ENV_DIR" output -raw artifacts_bucket)
+          prefix="ci/${{ github.run_id }}"
+          aws s3 cp "$BASELINE_DIR/cost_model.json" "s3://$bucket/$prefix/baseline_cost.json" || true
+          aws s3 cp "$ENV_DIR/cost_model.json" "s3://$bucket/$prefix/projected_dynamic_cost.json" || true
+          aws s3 cp "$ENV_DIR/guard.log" "s3://$bucket/$prefix/budget_guard.log" || true
+          [ -f health.log ] && aws s3 cp health.log "s3://$bucket/$prefix/health.log" || true
+
+  tests:
+    name: Test cases against the live stack
+    needs: apply
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.action == 'apply' && inputs.tests != 'none'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    environment: dev
+    concurrency:
+      group: dev-state
+      cancel-in-progress: false
+    env:
+      CI_TESTS: ${{ inputs.tests || 'basic' }}
+      FULL_PROFILE: ${{ inputs.full_profile && '1' || '0' }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: open-policy-agent/setup-opa@v2
+        with:
+          version: ${{ env.OPA_VERSION }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 14400
+
+      - name: Tools
+        run: |
+          pip install -r finops-app/requirements.txt
+          terraform -chdir="$ENV_DIR" init -input=false -backend-config=backend.hcl
+          terraform -chdir="$BASELINE_DIR" init -input=false
+
+      # basic = B1..B6; advanced = B1..B6 + A1..A5 (A1 replays the traffic profile, ~75 min).
+      - name: Run test cases
+        run: |
+          if [ "$CI_TESTS" = "advanced" ]; then
+            bash scripts/run_tests.sh all
+          else
+            bash scripts/run_tests.sh basic
+          fi
+
+      - name: Results
+        if: always()
+        run: |
+          summary=$(ls -td evidence/tests-*/ 2>/dev/null | head -1)
+          {
+            echo "## Test cases ($CI_TESTS)"
+            echo '```'
+            cat "${summary}summary.txt" 2>/dev/null || echo "no results"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-evidence
+          path: |
+            evidence/
+            reports/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  destroy:
+    name: Destroy
+    if: github.ref == 'refs/heads/main' && ((github.event_name == 'workflow_dispatch' && inputs.action == 'destroy') || github.event_name == 'schedule')
+    runs-on: ubuntu-latest
+    environment: dev
+    concurrency:
+      group: dev-state
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: terraform init
+        run: terraform -chdir="$ENV_DIR" init -input=false -backend-config=backend.hcl
+
+      # The artifacts bucket (evidence) is kept unless it is empty or
+      # artifacts_force_destroy was applied as true beforehand.
+      - name: terraform destroy
+        run: |
+          TF_VAR_budget_cap="$(grep -v '^[[:space:]]*#' data/budget_cap.txt | tr -d '[:space:]')"
+          export TF_VAR_budget_cap
+          terraform -chdir="$ENV_DIR" destroy -input=false -auto-approve -lock-timeout=5m

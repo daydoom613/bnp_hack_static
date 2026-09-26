@@ -1,0 +1,31 @@
+# FinOps dashboard (Definition of Done #8): Grafana on your laptop, reading live
+# CloudWatch data from the deployed stack. Nothing runs in AWS for it, so it costs
+# nothing beyond a few CloudWatch API reads.
+#
+#   AWS_PROFILE=<profile> docker compose -f observability/docker-compose.yml up -d
+#   open http://localhost:3000/d/finops-cloudscale     (anonymous view; admin/admin to edit)
+#
+# Credentials: your ~/.aws folder is mounted read-only and AWS_PROFILE picks the profile.
+# With SSO or temporary credentials, export AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY /
+# AWS_SESSION_TOKEN instead; they are passed through.
+services:
+  grafana:
+    image: grafana/grafana:11.3.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/finops-cloudscale.json
+      FINOPS_DASHBOARDS_DIR: /var/lib/grafana/dashboards
+      GF_AWS_ALLOWED_AUTH_PROVIDERS: default,keys,credentials
+      AWS_PROFILE: ${AWS_PROFILE:-default}
+      AWS_CONFIG_FILE: /aws/config
+      AWS_SHARED_CREDENTIALS_FILE: /aws/credentials
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+    volumes:
+      - ${AWS_DIR:-~/.aws}:/aws:ro
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
