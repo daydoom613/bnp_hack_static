@@ -1,0 +1,23 @@
+# Auto-assigns reviewers. Replace the handles with your real GitHub usernames.
+# Later rules win, so shared paths are listed last.
+
+# Infra, FinOps guard, scaling, chaos (Pranav)
+/terraform/                      @pranav-github
+/scripts/                        @pranav-github
+/chaos/                          @pranav-github
+/lambdas/                        @pranav-github
+/policies/                       @pranav-github
+/finops/                         @pranav-github
+/observability/                  @pranav-github
+/.github/                        @pranav-github
+/.gitattributes                  @pranav-github
+/.gitignore                      @pranav-github
+
+# App and traffic simulator (Rakshita)
+/app/                            @rakshita-github
+/finops-app/                     @rakshita-github
+/docker-compose.yml              @rakshita-github
+
+# Shared
+/data/                           @pranav-github @rakshita-github
+/README.md                       @pranav-github @rakshita-github

@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+
+<html lang="en">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+>
+
+<title>
+Dynamic AutoScale Cost Optimizer
+</title>
+
+<style>
+
+body {
+    margin: 0;
+    font-family: Arial, sans-serif;
+    background: #f4f6f8;
+}
+
+header {
+    padding: 24px 40px;
+    background: #111827;
+    color: white;
+}
+
+main {
+    padding: 30px 40px;
+}
+
+.grid {
+    display: grid;
+    grid-template-columns:
+        repeat(
+            auto-fit,
+            minmax(220px, 1fr)
+        );
+
+    gap: 20px;
+}
+
+.card {
+    background: white;
+    border-radius: 12px;
+    padding: 22px;
+    box-shadow:
+        0 2px 8px
+        rgba(0,0,0,0.08);
+}
+
+.label {
+    color: #6b7280;
+    font-size: 14px;
+}
+
+.value {
+    margin-top: 8px;
+    font-size: 30px;
+    font-weight: bold;
+}
+
+.alert {
+    margin-bottom: 20px;
+    padding: 15px;
+    background: #fee2e2;
+    color: #991b1b;
+    border-radius: 10px;
+    display: none;
+}
+
+.status {
+    margin-top: 30px;
+    background: white;
+    padding: 20px;
+    border-radius: 12px;
+}
+
+</style>
+
+</head>
+
+
+<body>
+
+<header>
+
+<h1>
+Dynamic AutoScale Cost Optimizer
+</h1>
+
+<p>
+Live FinOps and traffic dashboard
+</p>
+
+</header>
+
+
+<main>
+
+<div
+    id="budgetAlert"
+    class="alert"
+>
+
+⚠ Budget usage has reached
+90% or more.
+
+</div>
+
+
+<div class="grid">
+
+<div class="card">
+<div class="label">Current RPS</div>
+<div
+    id="rps"
+    class="value"
+>0</div>
+</div>
+
+
+<div class="card">
+<div class="label">Average Latency</div>
+<div
+    id="latency"
+    class="value"
+>0 ms</div>
+</div>
+
+
+<div class="card">
+<div class="label">Error Rate</div>
+<div
+    id="errors"
+    class="value"
+>0%</div>
+</div>
+
+
+<div class="card">
+<div class="label">Web Instances</div>
+<div
+    id="webInstances"
+    class="value"
+>0</div>
+</div>
+
+
+<div class="card">
+<div class="label">Worker Instances</div>
+<div
+    id="workerInstances"
+    class="value"
+>0</div>
+</div>
+
+
+<div class="card">
+<div class="label">Baseline Cost</div>
+<div
+    id="baseline"
+    class="value"
+>$0</div>
+</div>
+
+
+<div class="card">
+<div class="label">Optimized Cost</div>
+<div
+    id="optimized"
+    class="value"
+>$0</div>
+</div>
+
+
+<div class="card">
+<div class="label">Avoided Cost</div>
+<div
+    id="avoided"
+    class="value"
+>$0</div>
+</div>
+
+
+<div class="card">
+<div class="label">Savings</div>
+<div
+    id="savings"
+    class="value"
+>0%</div>
+</div>
+
+
+<div class="card">
+<div class="label">Budget Usage</div>
+<div
+    id="budget"
+    class="value"
+>0%</div>
+</div>
+
+</div>
+
+
+<div class="status">
+
+<strong>
+Auto refresh:
+</strong>
+
+Every 3 seconds.
+
+</div>
+
+</main>
+
+
+<script>
+
+async function updateDashboard() {
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/summary"
+            );
+
+        const data =
+            await response.json();
+
+
+        document
+            .getElementById("rps")
+            .innerText =
+            data.traffic.current_rps;
+
+
+        document
+            .getElementById("latency")
+            .innerText =
+            data.traffic.avg_latency_ms
+            + " ms";
+
+
+        document
+            .getElementById("errors")
+            .innerText =
+            data.traffic.error_rate_percent
+            + "%";
+
+
+        document
+            .getElementById(
+                "webInstances"
+            )
+            .innerText =
+            data.infrastructure
+                .web_instances;
+
+
+        document
+            .getElementById(
+                "workerInstances"
+            )
+            .innerText =
+            data.infrastructure
+                .worker_instances;
+
+
+        document
+            .getElementById(
+                "baseline"
+            )
+            .innerText =
+            "$"
+            + data.cost.baseline_cost;
+
+
+        document
+            .getElementById(
+                "optimized"
+            )
+            .innerText =
+            "$"
+            + data.cost.optimized_cost;
+
+
+        document
+            .getElementById(
+                "avoided"
+            )
+            .innerText =
+            "$"
+            + data.cost.avoided_cost;
+
+
+        document
+            .getElementById(
+                "savings"
+            )
+            .innerText =
+            data.cost.savings_percent
+            + "%";
+
+
+        document
+            .getElementById(
+                "budget"
+            )
+            .innerText =
+            data.cost
+                .budget_usage_percent
+            + "%";
+
+
+        const alert =
+            document.getElementById(
+                "budgetAlert"
+            );
+
+
+        alert.style.display =
+            data.cost.budget_alert
+            ? "block"
+            : "none";
+
+    }
+
+    catch (error) {
+
+        console.error(
+            "Dashboard update failed:",
+            error
+        );
+
+    }
+
+}
+
+
+updateDashboard();
+
+setInterval(
+    updateDashboard,
+    3000
+);
+
+</script>
+
+</body>
+
+</html>

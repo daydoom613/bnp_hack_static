@@ -1,0 +1,34 @@
+{
+  "Version": "0.1",
+  "Source": "finops/cost_model.py",
+  "Region": "eu-west-1",
+  "HoursPerMonth": 730,
+  "OnDemandRate": "on_demand",
+  "TotalMonthlyCost": 91.1,
+  "Projects": [
+    {
+      "Name": "baseline-static-infra",
+      "TotalMonthlyCost": 91.1,
+      "Resources": [
+        {
+          "Name": "module.web.aws_autoscaling_group.this",
+          "Type": "aws_autoscaling_group",
+          "InstanceType": "t3.small",
+          "OnDemandCount": 6,
+          "SpotCount": 0,
+          "MonthlyCost": 91.1,
+          "Pricing": {
+            "OnDemand": 0.0208,
+            "Spot": 0.0065,
+            "Region": "eu-west-1"
+          }
+        }
+      ]
+    }
+  ],
+  "UnpricedResources": [],
+  "Notes": [
+    "EC2 compute only, at ASG max_size, 730 h/month.",
+    "ALB, NAT and RDS are the same in both stacks and cancel out of avoided cost; see Infracost for the full bill."
+  ]
+}

@@ -1,0 +1,6 @@
+region,instance_type,on_demand_price_per_hour,reserved_price_per_hour,spot_price_per_hour
+eu-west-1,t3.nano,0.0058,0.0032,0.0019
+eu-west-1,t3.micro,0.0104,0.0056,0.0032
+eu-west-1,t3.small,0.0208,0.0112,0.0065
+eu-west-1,t3.medium,0.0416,0.0224,0.0130
+eu-west-1,c5.large,0.0850,0.0450,0.0280

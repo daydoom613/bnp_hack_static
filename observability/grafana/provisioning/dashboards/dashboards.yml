@@ -1,0 +1,10 @@
+apiVersion: 1
+
+providers:
+  - name: finops-cloudscale
+    folder: FinOps
+    type: file
+    disableDeletion: true
+    options:
+      # Set by docker-compose.yml (/var/lib/grafana/dashboards) or grafana-windows.ps1.
+      path: $FINOPS_DASHBOARDS_DIR

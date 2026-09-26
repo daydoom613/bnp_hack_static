@@ -1,0 +1,61 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+terraform.tfstate.d/
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+tfplan
+*.tfplan
+
+# Generated in CI / locally by the plan -> cost -> OPA pipeline
+plan.json
+cost_model.json
+opa_input.json
+opa_result.json
+infracost.json
+infracost.txt
+guard.log
+comment.md
+health.log
+cost_savings.csv
+
+# Lambda zips built during plan (CI carries them from plan to apply)
+lambda_build/
+
+# Load-test and chaos output: the copies of record are in the S3 artifacts bucket.
+# For the submission: git add -f reports/latest/cost_savings.csv
+/reports/
+/evidence/
+/ci-reports/
+/.cache/
+finops-app/reports/
+
+# Secrets and local config
+deploy_info.txt
+.env
+.env.*
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Private planning notes
+/chat.txt

@@ -1,0 +1,20 @@
+# Normalise line endings. Windows checkouts must not turn shell scripts or
+# Terraform into CRLF: a CRLF user_data.sh boots fine but never starts the app.
+* text=auto
+
+*.sh        text eol=lf
+*.tpl       text eol=lf
+Dockerfile  text eol=lf
+*.tf        text eol=lf
+*.tfvars    text eol=lf
+*.hcl       text eol=lf
+*.rego      text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.py        text eol=lf
+
+*.xlsx      binary
+*.docx      binary
+*.png       binary
+*.zip       binary
+*.bat       text eol=crlf

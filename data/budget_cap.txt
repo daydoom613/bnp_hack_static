@@ -1,0 +1,2 @@
+# Monthly budget cap (in USD) = the AWS credit we have. OPA blocks any plan projected above it.
+120
